@@ -22,6 +22,9 @@ import re
 from typing import Optional, Dict, Any
 import uvicorn
 
+from dotenv import load_dotenv
+from openai import AzureOpenAI
+
 # FastAPI imports
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +33,16 @@ from contextlib import asynccontextmanager
 
 # Import Kokoro TTS library
 from kokoro import KPipeline
+
+load_dotenv()
+
+AZURE_CLIENT = AzureOpenAI(
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+)
+
+AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 
 # Configure logging
 logging.basicConfig(
@@ -74,12 +87,12 @@ class ImageManager:
 
             # Log file info
             file_size = len(image_data)
-            logger.info(f"💾 Saved image: {filename} ({file_size:,} bytes)")
+            logger.info(f"Saved image: {filename} ({file_size:,} bytes)")
 
             return str(filepath)
 
         except Exception as e:
-            logger.error(f"❌ Error saving image: {e}")
+            logger.error(f"Error saving image: {e}")
             return None
 
     def verify_image(self, filepath: str) -> dict:
@@ -105,11 +118,11 @@ class ImageManager:
                     "valid": True,
                 }
 
-            logger.info(f"✅ Image verified: {info}")
+            logger.info(f"Image verified: {info}")
             return info
 
         except Exception as e:
-            logger.error(f"❌ Error verifying image {filepath}: {e}")
+            logger.error(f"Error verifying image {filepath}: {e}")
             return {"error": str(e), "valid": False}
 
 
@@ -191,199 +204,6 @@ class WhisperProcessor:
         except Exception as e:
             logger.error(f"Transcription error: {e}")
             return None
-
-
-class SmolVLMProcessor:
-    """Handles image + text processing using SmolVLM2 model"""
-
-    _instance = None
-
-    @classmethod
-    def get_instance(cls):
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
-    def __init__(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Using device for SmolVLM2: {self.device}")
-
-        # Load SmolVLM2 model
-        model_path = "HuggingFaceTB/SmolVLM2-256M-Video-Instruct"
-        logger.info(f"Loading {model_path}...")
-
-        self.processor = AutoProcessor.from_pretrained(model_path)
-        
-        # Only use flash_attention_2 if CUDA is available
-        model_kwargs = {
-            "torch_dtype": torch.bfloat16,
-            "device_map": "auto",
-        }
-        if self.device == "cuda":
-            model_kwargs["attn_implementation"] = "flash_attention_2"
-        
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            model_path,
-            **model_kwargs
-        )
-
-        logger.info("SmolVLM2 model ready for multimodal generation")
-
-        # Cache for most recent image
-        self.last_image = None
-        self.last_image_timestamp = 0
-        self.lock = asyncio.Lock()
-
-        # Message history management
-        self.message_history = []
-        self.max_history_messages = 4  # Keep last 4 exchanges
-
-        # Counter
-        self.generation_count = 0
-
-    async def set_image(self, image_data):
-        """Cache the most recent image received"""
-        async with self.lock:
-            try:
-                # Convert image data to PIL Image
-                image = Image.open(io.BytesIO(image_data))
-
-                # Resize to 75% of original size for efficiency
-                new_size = (int(image.size[0] * 0.75), int(image.size[1] * 0.75))
-                image = image.resize(new_size, Image.Resampling.LANCZOS)
-
-                # Clear message history when new image is set
-                self.message_history = []
-                self.last_image = image
-                self.last_image_timestamp = time.time()
-                logger.info("Image cached successfully")
-                return True
-            except Exception as e:
-                logger.error(f"Error processing image: {e}")
-                return False
-
-    async def process_text_with_image(self, text, initial_chunks=3):
-        """Process text with image context using SmolVLM2"""
-        async with self.lock:
-            try:
-                if not self.last_image:
-                    messages = [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": text},
-                            ],
-                        },
-                    ]
-                else:
-                    messages = [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image", "url": self.last_image},
-                                {"type": "text", "text": text},
-                            ],
-                        },
-                    ]
-
-                # Apply chat template
-                inputs = self.processor.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_dict=True,
-                    return_tensors="pt",
-                ).to(self.device, dtype=torch.bfloat16)
-
-                # Create a streamer for token-by-token generation
-                streamer = TextIteratorStreamer(
-                    tokenizer=self.processor.tokenizer,
-                    skip_special_tokens=True,
-                    skip_prompt=True,
-                    clean_up_tokenization_spaces=False,
-                )
-
-                # Configure generation parameters
-                generation_kwargs = dict(
-                    **inputs,
-                    do_sample=False,
-                    max_new_tokens=1200,
-                    streamer=streamer,
-                )
-
-                # Start generation in a separate thread
-                thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
-                thread.start()
-
-                # Collect initial text until we have a complete sentence or enough content
-                initial_text = ""
-                min_chars = 50  # Minimum characters to collect for initial chunk
-                sentence_end_pattern = re.compile(r"[.!?]")
-                has_sentence_end = False
-                initial_collection_stopped_early = False
-
-                # Collect the first sentence or minimum character count
-                for chunk in streamer:
-                    initial_text += chunk
-                    logger.info(f"Streaming chunk: '{chunk}'")
-
-                    # Check if we have a sentence end
-                    if sentence_end_pattern.search(chunk):
-                        has_sentence_end = True
-                        # If we have at least some content, break after sentence end
-                        if len(initial_text) >= min_chars / 2:
-                            initial_collection_stopped_early = True
-                            break
-
-                    # If we have enough content, break
-                    if len(initial_text) >= min_chars and (
-                        has_sentence_end or "," in initial_text
-                    ):
-                        initial_collection_stopped_early = True
-                        break
-
-                    # Safety check - if we've collected a lot of text without sentence end
-                    if len(initial_text) >= min_chars * 2:
-                        initial_collection_stopped_early = True
-                        break
-
-                # Return initial text and the streamer for continued generation
-                self.generation_count += 1
-                logger.info(
-                    f"SmolVLM2 initial generation: '{initial_text}' ({len(initial_text)} chars)"
-                )
-
-                # Store user message and initial response
-                self.pending_user_message = text
-                self.pending_response = initial_text
-
-                return streamer, initial_text, initial_collection_stopped_early
-
-            except Exception as e:
-                logger.error(f"SmolVLM2 streaming generation error: {e}")
-                return None, f"Error processing: {text}", False
-
-    def update_history_with_complete_response(
-        self, user_text, initial_response, remaining_text=None
-    ):
-        """Update message history with complete response, including any remaining text"""
-        # Combine initial and remaining text if available
-        complete_response = initial_response
-        if remaining_text:
-            complete_response = initial_response + remaining_text
-
-        # Add to history for context in future exchanges
-        self.message_history.append({"role": "user", "text": user_text})
-
-        self.message_history.append({"role": "assistant", "text": complete_response})
-
-        # Trim history to keep only recent messages
-        if len(self.message_history) > self.max_history_messages:
-            self.message_history = self.message_history[-self.max_history_messages :]
-
-        logger.info(
-            f"Updated message history with complete response ({len(complete_response)} chars)"
-        )
 
 
 class KokoroTTSProcessor:
@@ -483,7 +303,7 @@ class KokoroTTSProcessor:
                 combined_audio = np.concatenate(audio_segments)
                 self.synthesis_count += 1
                 logger.info(
-                    f"✨ Initial speech synthesis complete: {len(combined_audio)} samples, {len(all_word_timings)} word timings"
+                    f"Initial speech synthesis complete: {len(combined_audio)} samples, {len(all_word_timings)} word timings"
                 )
                 return combined_audio, all_word_timings
             return None, []
@@ -567,7 +387,7 @@ class KokoroTTSProcessor:
                 combined_audio = np.concatenate(audio_segments)
                 self.synthesis_count += 1
                 logger.info(
-                    f"✨ Chunk speech synthesis complete: {len(combined_audio)} samples, {len(all_word_timings)} word timings"
+                    f"Chunk speech synthesis complete: {len(combined_audio)} samples, {len(all_word_timings)} word timings"
                 )
                 return combined_audio, all_word_timings
             return None, []
@@ -620,6 +440,54 @@ async def collect_remaining_text(streamer, chunk_size=80):
                 yield current_chunk
             raise
 
+
+INTERVIEW_SYSTEM_PROMPT = """
+You are a professional human interviewer conducting a real job interview.
+
+Your responsibilities:
+- Lead the interview from start to finish.
+- Speak first by greeting the candidate politely.
+- Follow a structured interview flow:
+  1. Greeting and warm-up
+  2. Candidate introduction
+  3. Role confirmation
+  4. Experience discussion
+  5. Technical questions
+  6. Behavioral questions
+  7. Candidate questions
+  8. Professional wrap-up
+
+Behavior rules:
+- Always acknowledge the candidate’s response before asking the next question.
+- Ask only one clear question at a time.
+- Be calm, respectful, and professional.
+- Adapt naturally if the candidate hesitates, skips a question, or wants to stop.
+- Never pressure or argue with the candidate.
+- If the candidate wants to exit, end the interview gracefully.
+- If the candidate resumes, continue naturally.
+
+Tone:
+- Formal but warm
+- Conversational, not robotic
+- Encouraging and respectful
+
+Important constraints:
+- Do not mention that you are an AI.
+- Do not provide personal information about yourself.
+- Do not rush the interview.
+- Do not ask multiple questions at once.
+
+You are conducting a real interview, not a casual conversation.
+
+
+"""
+
+
+class InterviewSession:
+    def __init__(self):
+        self.history = []
+
+INTERVIEW_SESSIONS = {}
 
 # Store active connections
 class ConnectionManager:
@@ -706,7 +574,6 @@ async def lifespan(app: FastAPI):
     try:
         # Initialize processors to load models
         whisper_processor = WhisperProcessor.get_instance()
-        smolvlm_processor = SmolVLMProcessor.get_instance()
         tts_processor = KokoroTTSProcessor.get_instance()
         logger.info("All models initialized successfully")
     except Exception as e:
@@ -779,6 +646,31 @@ async def list_saved_images():
         return {"error": str(e)}
 
 
+async def call_interviewer_llm(client_id: str, user_text: str) -> str:
+    session = INTERVIEW_SESSIONS.setdefault(client_id, InterviewSession())
+
+    messages = [{"role": "system", "content": INTERVIEW_SYSTEM_PROMPT}]
+
+    for msg in session.history[-4:]:
+        messages.append(msg)
+
+    messages.append({"role": "user", "content": user_text})
+
+    response = AZURE_CLIENT.chat.completions.create(
+        model=AZURE_DEPLOYMENT,
+        messages=messages,
+        temperature=0.2,   # professionalism
+        max_tokens=180,
+    )
+
+    reply = response.choices[0].message.content.strip()
+
+    session.history.append({"role": "user", "content": user_text})
+    session.history.append({"role": "assistant", "content": reply})
+
+    return reply
+
+
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
     """WebSocket endpoint for real-time multimodal interaction"""
@@ -786,7 +678,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
     # Get instances of processors
     whisper_processor = WhisperProcessor.get_instance()
-    smolvlm_processor = SmolVLMProcessor.get_instance()
     tts_processor = KokoroTTSProcessor.get_instance()
 
     try:
@@ -812,7 +703,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 # Log what we received
                 if image_data:
                     logger.info(
-                        f"🎥 Processing audio+image segment: audio={len(audio_data)} bytes, image={len(image_data)} bytes"
+                        f"Processing audio+image segment: audio={len(audio_data)} bytes, image={len(image_data)} bytes"
                     )
                     manager.update_stats("audio_with_image_received")
 
@@ -825,16 +716,16 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         verification = manager.image_manager.verify_image(saved_path)
                         if verification.get("valid"):
                             logger.info(
-                                f"📸 Image verified successfully: {verification['size']} pixels"
+                                f"Image verified successfully: {verification['size']} pixels"
                             )
                         else:
                             logger.warning(
-                                f"⚠️ Image verification failed: {verification}"
+                                f"Image verification failed: {verification}"
                             )
 
                 else:
                     logger.info(
-                        f"🎤 Processing audio-only segment: {len(audio_data)} bytes"
+                        f"Processing audio-only segment: {len(audio_data)} bytes"
                     )
                     manager.update_stats("audio_segments_received")
 
@@ -855,26 +746,15 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     )
                     return
 
-                # Step 2: Set image if provided, then process text
-                if image_data:
-                    await smolvlm_processor.set_image(image_data)
-                    logger.info("🖼️ Image set for multimodal processing")
+                # Step 2: Call Azure OpenAI interviewer instead of SmolVLM2
+                logger.info("Calling Azure OpenAI interviewer")
+                initial_text = await call_interviewer_llm(client_id, transcribed_text)
 
-                # Process transcribed text with image using SmolVLM2
-                logger.info("Starting SmolVLM2 generation")
-                streamer, initial_text, initial_collection_stopped_early = (
-                    await smolvlm_processor.process_text_with_image(transcribed_text)
-                )
+                streamer = None
+                initial_collection_stopped_early = False
                 logger.info(
-                    f"SmolVLM2 initial text: '{initial_text[:50]}...' ({len(initial_text)} chars)"
+                    f"Interviewer response: '{initial_text[:50]}...' ({len(initial_text)} chars)"
                 )
-
-                # Check if VLM response indicates noise
-                if initial_text.startswith("NOISE:"):
-                    logger.info(
-                        f"Noise detected in VLM processing: '{initial_text}'. Skipping TTS."
-                    )
-                    return
 
                 # Step 3: Generate TTS for initial text WITH NATIVE TIMING
                 if initial_text:
@@ -910,7 +790,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # Send audio with native timing information
                         audio_message = {
                             "audio": base64_audio,
-                            "word_timings": initial_timings,  # 🎉 NATIVE TIMING DATA!
+                            "word_timings": initial_timings,
                             "sample_rate": 24000,
                             "method": "native_kokoro_timing",
                             "modality": "multimodal" if image_data else "audio_only",
@@ -918,129 +798,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
                         await websocket.send_text(json.dumps(audio_message))
                         logger.info(
-                            f"✨ Initial audio sent to client with {len(initial_timings)} NATIVE word timings [{audio_message['modality']}]"
+                            f"Initial audio sent to client with {len(initial_timings)} native word timings [{audio_message['modality']}]"
                         )
 
-                        # Step 4: Process remaining text chunks if available
-                        if initial_collection_stopped_early:
-                            logger.info("Processing remaining text chunks")
-                            collected_chunks = []
-
-                            try:
-                                text_iterator = collect_remaining_text(streamer)
-
-                                while True:
-                                    try:
-                                        text_chunk = await anext(text_iterator)
-                                        logger.info(
-                                            f"Processing text chunk: '{text_chunk[:30]}...' ({len(text_chunk)} chars)"
-                                        )
-                                        collected_chunks.append(text_chunk)
-
-                                        # Generate TTS for this chunk WITH NATIVE TIMING
-                                        chunk_tts_task = asyncio.create_task(
-                                            tts_processor.synthesize_remaining_speech_with_timing(
-                                                text_chunk
-                                            )
-                                        )
-                                        manager.set_task(
-                                            client_id, "tts", chunk_tts_task
-                                        )
-
-                                        # FIXED: Properly unpack the tuple for chunks too
-                                        chunk_tts_result = await chunk_tts_task
-                                        if (
-                                            isinstance(chunk_tts_result, tuple)
-                                            and len(chunk_tts_result) == 2
-                                        ):
-                                            chunk_audio, chunk_timings = (
-                                                chunk_tts_result
-                                            )
-                                        else:
-                                            # Fallback for legacy method
-                                            chunk_audio = chunk_tts_result
-                                            chunk_timings = []
-                                            logger.warning(
-                                                "Chunk TTS returned single value instead of tuple"
-                                            )
-
-                                        logger.info(
-                                            f"Chunk TTS complete: {len(chunk_audio) if chunk_audio is not None else 0} samples, {len(chunk_timings)} word timings"
-                                        )
-
-                                        if (
-                                            chunk_audio is not None
-                                            and len(chunk_audio) > 0
-                                        ):
-                                            # Convert to base64 and send to client WITH TIMING DATA
-                                            audio_bytes = (
-                                                (chunk_audio * 32767)
-                                                .astype(np.int16)
-                                                .tobytes()
-                                            )
-                                            base64_audio = base64.b64encode(
-                                                audio_bytes
-                                            ).decode("utf-8")
-
-                                            # Send chunk audio with native timing information
-                                            chunk_audio_message = {
-                                                "audio": base64_audio,
-                                                "word_timings": chunk_timings,  # 🎉 NATIVE TIMING DATA!
-                                                "sample_rate": 24000,
-                                                "method": "native_kokoro_timing",
-                                                "chunk": True,
-                                                "modality": (
-                                                    "multimodal"
-                                                    if image_data
-                                                    else "audio_only"
-                                                ),
-                                            }
-
-                                            await websocket.send_text(
-                                                json.dumps(chunk_audio_message)
-                                            )
-                                            logger.info(
-                                                f"✨ Chunk audio sent to client with {len(chunk_timings)} NATIVE word timings [{chunk_audio_message['modality']}]"
-                                            )
-
-                                    except StopAsyncIteration:
-                                        logger.info("All text chunks processed")
-                                        break
-                                    except asyncio.CancelledError:
-                                        logger.info("Text chunk processing cancelled")
-                                        raise
-
-                                # Update history with complete response
-                                if collected_chunks:
-                                    complete_remaining_text = "".join(collected_chunks)
-                                    smolvlm_processor.update_history_with_complete_response(
-                                        transcribed_text,
-                                        initial_text,
-                                        complete_remaining_text,
-                                    )
-
-                            except asyncio.CancelledError:
-                                logger.info("Remaining text processing cancelled")
-                                # Update history with partial response
-                                if collected_chunks:
-                                    partial_remaining_text = "".join(collected_chunks)
-                                    smolvlm_processor.update_history_with_complete_response(
-                                        transcribed_text,
-                                        initial_text,
-                                        partial_remaining_text,
-                                    )
-                                else:
-                                    smolvlm_processor.update_history_with_complete_response(
-                                        transcribed_text, initial_text
-                                    )
-                                return
-                        else:
-                            # No remaining text, just update history with initial response
-                            smolvlm_processor.update_history_with_complete_response(
-                                transcribed_text, initial_text
-                            )
-
-                        # Signal end of audio stream
+                        # No remaining text processing since we use Azure OpenAI
                         await websocket.send_text(json.dumps({"audio_complete": True}))
                         logger.info("Audio processing complete")
 
@@ -1109,11 +870,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                         saved_path
                                     )
                                     logger.info(
-                                        f"📸 Standalone image saved and verified: {verification}"
+                                        f"Standalone image saved and verified: {verification}"
                                     )
-
-                                await smolvlm_processor.set_image(image_data)
-                                logger.info("Image updated")
 
                         # Handle realtime input (for backward compatibility)
                         elif "realtime_input" in message:
@@ -1155,10 +913,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                                 )
                                             )
                                             logger.info(
-                                                f"📸 Realtime image saved and verified: {verification}"
+                                                f"Realtime image saved and verified: {verification}"
                                             )
-
-                                        await smolvlm_processor.set_image(image_data)
 
                     except json.JSONDecodeError as e:
                         logger.error(f"Error decoding JSON: {e}")

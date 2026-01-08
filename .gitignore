@@ -11,3 +11,15 @@ node_modules/
 # OS
 .DS_Store
 Thumbs.db
+
+# Python virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Virtualenv created inside subfolders
+*/venv/
+*/.venv/
+*/env/
+*/ENV/
