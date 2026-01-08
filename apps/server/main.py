@@ -487,7 +487,9 @@ class InterviewSession:
     def __init__(self):
         self.history = []
 
+
 INTERVIEW_SESSIONS = {}
+
 
 # Store active connections
 class ConnectionManager:
@@ -659,7 +661,7 @@ async def call_interviewer_llm(client_id: str, user_text: str) -> str:
     response = AZURE_CLIENT.chat.completions.create(
         model=AZURE_DEPLOYMENT,
         messages=messages,
-        temperature=0.2,   # professionalism
+        temperature=0.2,  # professionalism
         max_tokens=180,
     )
 
@@ -719,9 +721,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 f"Image verified successfully: {verification['size']} pixels"
                             )
                         else:
-                            logger.warning(
-                                f"Image verification failed: {verification}"
-                            )
+                            logger.warning(f"Image verification failed: {verification}")
 
                 else:
                     logger.info(
