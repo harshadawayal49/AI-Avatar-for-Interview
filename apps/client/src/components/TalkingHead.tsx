@@ -343,7 +343,7 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
           lipsyncModules: ['en'],
           lipsyncLang: 'en',
           modelFPS: 30,
-          cameraView: 'full',
+          cameraView: 'upper',
           avatarMute: false,
           avatarMood: selectedMood
         });
