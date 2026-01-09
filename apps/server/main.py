@@ -182,11 +182,10 @@ class WhisperProcessor:
                 None,
                 lambda: self.pipe(
                     audio_array,
-                    return_timestamps=True,   # 🔥 REQUIRED
+                    return_timestamps=True,  # 🔥 REQUIRED
                     chunk_length_s=30,
-                )
+                ),
             )
-
 
             text = result["text"].strip()
             self.transcription_count += 1
@@ -742,8 +741,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 logger.info(f"Interviewer reply: {reply[:60]}...")
 
                 # 3️⃣ TTS
-                audio, timings = await tts_processor.synthesize_initial_speech_with_timing(
-                    reply
+                audio, timings = (
+                    await tts_processor.synthesize_initial_speech_with_timing(reply)
                 )
 
                 if audio is None or len(audio) == 0:
@@ -804,7 +803,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     finally:
         await manager.cancel_current_tasks(client_id)
         manager.disconnect(client_id)
-
 
 
 def main():
