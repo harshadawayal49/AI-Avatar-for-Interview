@@ -21,6 +21,7 @@ from threading import Thread
 import re
 from typing import Optional, Dict, Any
 import uvicorn
+import time
 
 from dotenv import load_dotenv
 from openai import AzureOpenAI
@@ -171,39 +172,39 @@ class WhisperProcessor:
         self.transcription_count = 0
 
     async def transcribe_audio(self, audio_bytes):
-        """Transcribe audio bytes to text"""
+        """Transcribe audio bytes to text (safe length)"""
         try:
-            # Convert audio bytes to numpy array
             audio_array = (
                 np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             )
 
-            # Run transcription in executor to avoid blocking
             result = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.pipe(audio_array)
+                None,
+                lambda: self.pipe(
+                    audio_array,
+                    return_timestamps=True,  # 🔥 REQUIRED
+                    chunk_length_s=30,
+                ),
             )
 
-            transcribed_text = result["text"].strip()
+            text = result["text"].strip()
             self.transcription_count += 1
 
-            logger.info(
-                f"Transcription #{self.transcription_count}: '{transcribed_text}'"
-            )
+            logger.info(f"Transcription #{self.transcription_count}: '{text}'")
 
-            # Check for noise/empty transcription
-            if not transcribed_text or len(transcribed_text) < 3:
+            if not text or len(text) < 3:
                 return "NO_SPEECH"
 
-            # Check for common noise indicators
-            noise_indicators = ["thank you", "thanks for watching", "you", ".", ""]
-            if transcribed_text.lower().strip() in noise_indicators:
-                return "NOISE_DETECTED"
-
-            return transcribed_text
+            return text
 
         except Exception as e:
             logger.error(f"Transcription error: {e}")
             return None
+
+
+AUDIO_BUFFERS = {}
+LAST_AUDIO_TIME = {}
+SILENCE_THRESHOLD = 1.2  # seconds
 
 
 class KokoroTTSProcessor:
@@ -675,298 +676,131 @@ async def call_interviewer_llm(client_id: str, user_text: str) -> str:
 
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
-    """WebSocket endpoint for real-time multimodal interaction"""
     await manager.connect(websocket, client_id)
 
-    # Get instances of processors
     whisper_processor = WhisperProcessor.get_instance()
     tts_processor = KokoroTTSProcessor.get_instance()
 
+    async def speak_text_immediately(text: str):
+        logger.info(f"Speaking immediately: {text}")
+
+        audio, timings = await tts_processor.synthesize_initial_speech_with_timing(text)
+
+        if audio is None or len(audio) == 0:
+            logger.warning("TTS produced no audio")
+            return
+
+        audio_bytes = (audio * 32767).astype(np.int16).tobytes()
+        base64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "audio": base64_audio,
+                    "word_timings": timings,
+                    "sample_rate": 24000,
+                    "method": "native_kokoro_timing",
+                    "modality": "greeting",
+                }
+            )
+        )
+
+        await websocket.send_text(json.dumps({"audio_complete": True}))
+
     try:
-        # Send initial configuration confirmation
+        # 🔹 Confirm connection
         await websocket.send_text(
             json.dumps({"status": "connected", "client_id": client_id})
         )
 
-        async def send_keepalive():
-            """Send periodic keepalive pings"""
-            while True:
-                try:
-                    await websocket.send_text(
-                        json.dumps({"type": "ping", "timestamp": time.time()})
-                    )
-                    await asyncio.sleep(10)  # Send ping every 10 seconds
-                except Exception:
-                    break
-
-        async def process_audio_segment(audio_data, image_data=None):
-            """Process a complete audio segment through the pipeline with optional image"""
-            try:
-                # Log what we received
-                if image_data:
-                    logger.info(
-                        f"Processing audio+image segment: audio={len(audio_data)} bytes, image={len(image_data)} bytes"
-                    )
-                    manager.update_stats("audio_with_image_received")
-
-                    # Save the image for verification
-                    saved_path = manager.image_manager.save_image(
-                        image_data, client_id, "multimodal"
-                    )
-                    if saved_path:
-                        # Verify the saved image
-                        verification = manager.image_manager.verify_image(saved_path)
-                        if verification.get("valid"):
-                            logger.info(
-                                f"Image verified successfully: {verification['size']} pixels"
-                            )
-                        else:
-                            logger.warning(f"Image verification failed: {verification}")
-
-                else:
-                    logger.info(
-                        f"Processing audio-only segment: {len(audio_data)} bytes"
-                    )
-                    manager.update_stats("audio_segments_received")
-
-                # Send interrupt immediately since frontend determined this is valid speech
-                logger.info("Sending interrupt signal")
-                interrupt_message = json.dumps({"interrupt": True})
-                await websocket.send_text(interrupt_message)
-
-                # Step 1: Transcribe audio with Whisper
-                logger.info("Starting Whisper transcription")
-                transcribed_text = await whisper_processor.transcribe_audio(audio_data)
-                logger.info(f"Transcription result: '{transcribed_text}'")
-
-                # Check if transcription indicates noise
-                if transcribed_text in ["NOISE_DETECTED", "NO_SPEECH", None]:
-                    logger.info(
-                        f"Noise detected in transcription: '{transcribed_text}'. Skipping further processing."
-                    )
-                    return
-
-                # Step 2: Call Azure OpenAI interviewer instead of SmolVLM2
-                logger.info("Calling Azure OpenAI interviewer")
-                initial_text = await call_interviewer_llm(client_id, transcribed_text)
-
-                streamer = None
-                initial_collection_stopped_early = False
-                logger.info(
-                    f"Interviewer response: '{initial_text[:50]}...' ({len(initial_text)} chars)"
-                )
-
-                # Step 3: Generate TTS for initial text WITH NATIVE TIMING
-                if initial_text:
-                    logger.info("Starting TTS for initial text")
-                    tts_task = asyncio.create_task(
-                        tts_processor.synthesize_initial_speech_with_timing(
-                            initial_text
-                        )
-                    )
-                    manager.set_task(client_id, "tts", tts_task)
-
-                    # FIXED: Properly unpack the tuple
-                    tts_result = await tts_task
-                    if isinstance(tts_result, tuple) and len(tts_result) == 2:
-                        initial_audio, initial_timings = tts_result
-                    else:
-                        # Fallback for legacy method
-                        initial_audio = tts_result
-                        initial_timings = []
-                        logger.warning(
-                            "TTS returned single value instead of tuple - no timing data available"
-                        )
-
-                    logger.info(
-                        f"Initial TTS complete: {len(initial_audio) if initial_audio is not None else 0} samples, {len(initial_timings)} word timings"
-                    )
-
-                    if initial_audio is not None and len(initial_audio) > 0:
-                        # Convert to base64 and send to client WITH TIMING DATA
-                        audio_bytes = (initial_audio * 32767).astype(np.int16).tobytes()
-                        base64_audio = base64.b64encode(audio_bytes).decode("utf-8")
-
-                        # Send audio with native timing information
-                        audio_message = {
-                            "audio": base64_audio,
-                            "word_timings": initial_timings,
-                            "sample_rate": 24000,
-                            "method": "native_kokoro_timing",
-                            "modality": "multimodal" if image_data else "audio_only",
-                        }
-
-                        await websocket.send_text(json.dumps(audio_message))
-                        logger.info(
-                            f"Initial audio sent to client with {len(initial_timings)} native word timings [{audio_message['modality']}]"
-                        )
-
-                        # No remaining text processing since we use Azure OpenAI
-                        await websocket.send_text(json.dumps({"audio_complete": True}))
-                        logger.info("Audio processing complete")
-
-            except asyncio.CancelledError:
-                logger.info("Audio processing cancelled")
-                raise
-            except Exception as e:
-                logger.error(f"Error processing audio segment: {e}")
-                # Add more detailed error info
-                import traceback
-
-                logger.error(f"Full traceback: {traceback.format_exc()}")
-
-        async def receive_and_process():
-            """Receive and process messages from the client"""
-            try:
-                while True:
-                    data = await websocket.receive_text()
-                    try:
-                        message = json.loads(data)
-
-                        # Handle complete audio segments from frontend
-                        if "audio_segment" in message:
-                            # Cancel any current processing
-                            await manager.cancel_current_tasks(client_id)
-
-                            # Decode audio data
-                            audio_data = base64.b64decode(message["audio_segment"])
-
-                            # Check if image is also included
-                            image_data = None
-                            if "image" in message:
-                                image_data = base64.b64decode(message["image"])
-                                logger.info(
-                                    f"Received audio+image: audio={len(audio_data)} bytes, image={len(image_data)} bytes"
-                                )
-                            else:
-                                logger.info(
-                                    f"Received audio-only: {len(audio_data)} bytes"
-                                )
-
-                            # Start processing the audio segment with optional image
-                            processing_task = asyncio.create_task(
-                                process_audio_segment(audio_data, image_data)
-                            )
-                            manager.set_task(client_id, "processing", processing_task)
-
-                        # Handle standalone images (only if not currently processing)
-                        elif "image" in message:
-                            if not (
-                                client_id in manager.current_tasks
-                                and manager.current_tasks[client_id]["processing"]
-                                and not manager.current_tasks[client_id][
-                                    "processing"
-                                ].done()
-                            ):
-                                image_data = base64.b64decode(message["image"])
-                                manager.update_stats("images_received")
-
-                                # Save standalone image
-                                saved_path = manager.image_manager.save_image(
-                                    image_data, client_id, "standalone"
-                                )
-                                if saved_path:
-                                    verification = manager.image_manager.verify_image(
-                                        saved_path
-                                    )
-                                    logger.info(
-                                        f"Standalone image saved and verified: {verification}"
-                                    )
-
-                        # Handle realtime input (for backward compatibility)
-                        elif "realtime_input" in message:
-                            for chunk in message["realtime_input"]["media_chunks"]:
-                                if chunk["mime_type"] == "audio/pcm":
-                                    # Treat as complete audio segment
-                                    await manager.cancel_current_tasks(client_id)
-
-                                    audio_data = base64.b64decode(chunk["data"])
-                                    processing_task = asyncio.create_task(
-                                        process_audio_segment(audio_data)
-                                    )
-                                    manager.set_task(
-                                        client_id, "processing", processing_task
-                                    )
-
-                                elif chunk["mime_type"] == "image/jpeg":
-                                    # Only process image if not currently processing audio
-                                    if not (
-                                        client_id in manager.current_tasks
-                                        and manager.current_tasks[client_id][
-                                            "processing"
-                                        ]
-                                        and not manager.current_tasks[client_id][
-                                            "processing"
-                                        ].done()
-                                    ):
-                                        image_data = base64.b64decode(chunk["data"])
-                                        manager.update_stats("images_received")
-
-                                        # Save image from realtime input
-                                        saved_path = manager.image_manager.save_image(
-                                            image_data, client_id, "realtime"
-                                        )
-                                        if saved_path:
-                                            verification = (
-                                                manager.image_manager.verify_image(
-                                                    saved_path
-                                                )
-                                            )
-                                            logger.info(
-                                                f"Realtime image saved and verified: {verification}"
-                                            )
-
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Error decoding JSON: {e}")
-                        await websocket.send_text(
-                            json.dumps({"error": "Invalid JSON format"})
-                        )
-                    except KeyError as e:
-                        logger.error(f"Missing key in message: {e}")
-                        await websocket.send_text(
-                            json.dumps({"error": f"Missing required field: {e}"})
-                        )
-                    except Exception as e:
-                        logger.error(f"Error processing message: {e}")
-                        await websocket.send_text(
-                            json.dumps({"error": f"Processing error: {str(e)}"})
-                        )
-
-            except WebSocketDisconnect:
-                logger.info("WebSocket connection closed during receive loop")
-
-        # Run tasks concurrently
-        receive_task = asyncio.create_task(receive_and_process())
-        keepalive_task = asyncio.create_task(send_keepalive())
-
-        # Wait for any task to complete (usually due to disconnection or error)
-        done, pending = await asyncio.wait(
-            [receive_task, keepalive_task],
-            return_when=asyncio.FIRST_COMPLETED,
+        # 🔹 PROFESSIONAL GREETING (FIRST THING USER HEARS)
+        GREETING = (
+            "Good day. Thank you for joining me today. "
+            "I will be conducting your interview. "
+            "To begin, could you please tell me a bit about yourself and your background?"
         )
 
-        # Cancel pending tasks
-        for task in pending:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        await speak_text_immediately(GREETING)
 
-        # Log results of completed tasks
-        for task in done:
+        async def process_audio_segment(audio_data: bytes):
             try:
-                result = task.result()
+                await manager.cancel_current_tasks(client_id)
+
+                # Interrupt avatar speech immediately
+                await websocket.send_text(json.dumps({"interrupt": True}))
+
+                # 1️⃣ Whisper
+                transcribed_text = await whisper_processor.transcribe_audio(audio_data)
+                logger.info(f"Transcription result: {transcribed_text}")
+
+                if transcribed_text in ["NO_SPEECH", None]:
+                    return
+
+                # 2️⃣ LLM Interviewer
+                reply = await call_interviewer_llm(client_id, transcribed_text)
+                logger.info(f"Interviewer reply: {reply[:60]}...")
+
+                # 3️⃣ TTS
+                audio, timings = (
+                    await tts_processor.synthesize_initial_speech_with_timing(reply)
+                )
+
+                if audio is None or len(audio) == 0:
+                    return
+
+                audio_bytes = (audio * 32767).astype(np.int16).tobytes()
+                base64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "audio": base64_audio,
+                            "word_timings": timings,
+                            "sample_rate": 24000,
+                            "method": "native_kokoro_timing",
+                            "modality": "audio_only",
+                        }
+                    )
+                )
+
+                await websocket.send_text(json.dumps({"audio_complete": True}))
+
+            except asyncio.CancelledError:
+                logger.info("Audio task cancelled")
+                raise
             except Exception as e:
-                logger.error(f"Task finished with error: {e}")
+                logger.error(f"Audio processing error: {e}")
+
+        while True:
+            message = json.loads(await websocket.receive_text())
+
+            if "audio_segment" in message:
+                audio_data = base64.b64decode(message["audio_segment"])
+
+                now = time.time()
+                LAST_AUDIO_TIME[client_id] = now
+
+                if client_id not in AUDIO_BUFFERS:
+                    AUDIO_BUFFERS[client_id] = bytearray()
+
+                AUDIO_BUFFERS[client_id].extend(audio_data)
+
+                # Schedule silence check
+                async def check_silence():
+                    await asyncio.sleep(SILENCE_THRESHOLD)
+                    last_time = LAST_AUDIO_TIME.get(client_id)
+
+                    if last_time and time.time() - last_time >= SILENCE_THRESHOLD:
+                        full_audio = bytes(AUDIO_BUFFERS.pop(client_id))
+                        logger.info("User finished speaking — processing full answer")
+
+                        await process_audio_segment(full_audio)
+
+                asyncio.create_task(check_silence())
 
     except WebSocketDisconnect:
-        logger.info(f"Client {client_id} disconnected normally")
-    except Exception as e:
-        logger.error(f"WebSocket session error for client {client_id}: {e}")
+        logger.info(f"Client {client_id} disconnected")
     finally:
-        # Cleanup
-        logger.info(f"Cleaning up resources for client {client_id}")
         await manager.cancel_current_tasks(client_id)
         manager.disconnect(client_id)
 
